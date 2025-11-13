@@ -1,0 +1,74 @@
+business_hours: 09:00-17:00
+interval_minutes: 30
+days: 21
+seed: 42
+daily_volume_by_dow:
+  mon: 500
+  tue: 520
+  wed: 520
+  thu: 510
+  fri: 480
+  sat: 200
+  sun: 150
+intraday_profile:
+- 0.05
+- 0.06
+- 0.08
+- 0.09
+- 0.1
+- 0.08
+- 0.06
+- 0.05
+- 0.05
+- 0.08
+- 0.1
+- 0.08
+- 0.07
+- 0.06
+- 0.05
+- 0.04
+channels:
+- email
+- chat
+- phone
+channel_mix:
+  email: 0.5
+  chat: 0.3
+  phone: 0.2
+issue_types:
+- login
+- billing
+- bug
+issue_mix:
+  login: 0.45
+  billing: 0.3
+  bug: 0.25
+aht_seconds:
+  global_mean: 240
+  global_sd: 60
+acw_seconds:
+  global_mean: 60
+  global_sd: 20
+fcr_baseline_pct: 78
+fcr_noise_pct: 3
+agents:
+  total: 20
+  schedule: 09:00-17:00
+  shrinkage_minutes_per_interval_mean: 2
+  shrinkage_minutes_per_interval_sd: 1
+bad_release:
+  day_index: 10
+  start_hhmm: '13:00'
+  end_hhmm: '17:00'
+  aht_multiplier: 1.35
+  acw_multiplier: 1.1
+  fcr_delta_pct: -5
+sla_policy:
+  kpi: first_response
+  target_minutes: 15
+  coverage_hours: 09:00-17:00
+  target_pct: 90.0
+ops_cost:
+  agent_rate: 22.0
+  ot_rate: 33.0
+timezone: America/Chicago
