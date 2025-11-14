@@ -4,6 +4,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
 # add project root (sla-radar/) to sys.path so "src" imports work
 import os, sys
@@ -72,6 +74,27 @@ def load_interval_inputs():
     finally:
         con.close()
 
+@st.cache_data(show_spinner=False)
+def compute_daily_modeled_sla(db: Path) -> pd.Series:
+    """
+    Run the baseline What-If model (no deltas) and return
+    modeled mean SLA per calendar day.
+    """
+    cfg = WhatIfConfig(
+        acw_reduction_pct=0.0,
+        fcr_uplift_pct=0.0,
+        extra_agents=0,
+        ot_hourly=0.0,  # cost not needed for attribution
+    )
+    df = simulate_what_if(cfg, db=db)
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    df["day"] = df["interval_start"].dt.date
+    daily_sla = df.groupby("day")["sla_attainment_pct"].mean()
+    return daily_sla
+
+
 st.set_page_config(page_title="SLA Drift Radar", layout="wide")
 st.title("SLA Drift Radar & Staffing What-Ifs")
 
@@ -94,30 +117,551 @@ with tab_radar:
 
 # --- WHY TAB ---
 with tab_why:
-    st.subheader("Drift Timeline (EWMA)")
-    events = run_drift(DB, DriftConfig(alpha=0.3, hysteresis_k=1.8, min_run=2))
-    if events.empty:
-        st.info("No sustained drift events detected with current thresholds.")
-    else:
-        st.dataframe(events.tail(20), use_container_width=True)
-        # Quick timeline figure
-        ef = events.copy()
-        ef["event_ts"] = pd.to_datetime(ef["event_ts"])
-        fig_ev = px.scatter(ef, x="event_ts", y="score", color="metric_name",
-                            symbol="direction", title="Detected Drift Events")
-        st.plotly_chart(fig_ev, use_container_width=True)
+    st.subheader("Drift Timeline: Metrics vs EWMA Score")
 
-    # Simple contribution waterfall proxy
-    st.subheader("Contribution Breakdown (Δ vs. baseline)")
-    # For MVP: show last-day averages vs. prior-day averages for AHT/ACW/Arrivals
-    df["day"] = df["interval_start"].dt.date
-    last_day = df["day"].max()
-    prev_day = sorted(df["day"].unique())[-2]
-    agg = (df.groupby("day")[["avg_aht_seconds","avg_acw_seconds","arrivals"]].mean()
-             .loc[[prev_day,last_day]].diff().iloc[-1].rename({"avg_aht_seconds":"ΔAHT","avg_acw_seconds":"ΔACW","arrivals":"ΔArrivals"}))
-    wf = pd.DataFrame({"component": agg.index, "delta": agg.values})
-    fig_wf = px.bar(wf, x="component", y="delta", title=f"Contributions: {prev_day} → {last_day}")
-    st.plotly_chart(fig_wf, use_container_width=True)
+    # Load interval metrics and restrict to recent window
+    df_why = load_interval_inputs().sort_values("interval_start")
+    if df_why.empty:
+        st.info("No interval data available to compute drift.")
+    else:
+        last_ts = df_why["interval_start"].max()
+        cutoff = last_ts - pd.Timedelta(days=7)  # last 7 days
+        ts = df_why[df_why["interval_start"] >= cutoff].copy()
+
+        # Load drift events and align to same window
+        events = run_drift(DB, DriftConfig(alpha=0.3, hysteresis_k=1.8, min_run=2))
+
+        if events.empty:
+            st.info("No sustained drift events detected with current thresholds.")
+            events_window = pd.DataFrame()
+        else:
+            events_window = events.copy()
+            events_window["event_ts"] = pd.to_datetime(events_window["event_ts"])
+            events_window = events_window[events_window["event_ts"] >= cutoff]
+
+        # --- Combined time-series: AHT / ACW / Arrivals vs Drift Score ---
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # Primary axis: operational metrics
+        fig.add_trace(
+            go.Scatter(
+                x=ts["interval_start"],
+                y=ts["aht_eff_seconds"],
+                name="AHT eff (sec)",
+                mode="lines",
+            ),
+            secondary_y=False,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=ts["interval_start"],
+                y=ts["avg_acw_seconds"],
+                name="ACW (sec)",
+                mode="lines",
+                line=dict(dash="dot"),
+            ),
+            secondary_y=False,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=ts["interval_start"],
+                y=ts["arrivals"],
+                name="Arrivals",
+                mode="lines",
+                line=dict(dash="dash"),
+            ),
+            secondary_y=False,
+        )
+
+        # Secondary axis: drift score markers (if any)
+        if not events_window.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=events_window["event_ts"],
+                    y=events_window["score"],
+                    mode="markers",
+                    name="Drift score",
+                    marker=dict(size=8),
+                    text=events_window["metric_name"] + " / " + events_window["direction"],
+                    hovertemplate=(
+                        "metric=%{text}"
+                        "<br>score=%{y:.2f}"
+                        "<br>time=%{x}"
+                        "<extra></extra>"
+                    ),
+                ),
+                secondary_y=True,
+            )
+
+        fig.update_layout(
+            title="Drift Timeline (Last 7 Days)",
+            hovermode="x unified",
+            margin=dict(l=40, r=40, t=60, b=40),
+        )
+        fig.update_yaxes(
+            title_text="AHT / ACW (sec) & Arrivals",
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title_text="Drift score",
+            secondary_y=True,
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Optional: raw events table in an expander
+        if not events_window.empty:
+            with st.expander("Raw drift events (debug view)"):
+                st.dataframe(
+                    events_window.sort_values("event_ts"),
+                    use_container_width=True,
+                )
+
+        # --- Today So Far – Early Warning ---
+        st.subheader("Today So Far – Early Warning")
+
+        # Add day + collect history
+        df_why["day"] = df_why["interval_start"].dt.date
+        days = sorted(df_why["day"].unique())
+
+        if len(days) < 2:
+            st.info("Not enough history to compute early warning baselines yet.")
+        else:
+            last_day = days[-1]
+            previous_days = [d for d in days if d < last_day]
+            baseline_days = previous_days[-6:] if previous_days else []
+
+            if not baseline_days:
+                st.info(
+                    "Only one day of data available; early warning baselines will "
+                    "appear once multiple days are loaded."
+                )
+            else:
+                N = 4  # number of most recent intervals to inspect
+
+                today_df = df_why[df_why["day"] == last_day].copy()
+                if len(today_df) < N:
+                    st.info(
+                        "Not enough intervals so far today to compute early warnings."
+                    )
+                else:
+                    # Prepare baseline + today, aligned by time-of-day
+                    today_df = today_df.sort_values("interval_start")
+                    today_df["time_of_day"] = today_df["interval_start"].dt.time
+
+                    baseline = df_why[df_why["day"].isin(baseline_days)].copy()
+                    baseline["time_of_day"] = baseline["interval_start"].dt.time
+
+                    def summarize_metric(col, label, normal_tol=0.10, warn_tol=0.20):
+                        """
+                        Compare the last N intervals for `col` vs a 7-day baseline
+                        at the same time-of-day, and return a human-readable sentence.
+                        """
+                        base_stats = (
+                            baseline.groupby("time_of_day")[col]
+                            .mean()
+                            .rename("baseline_mean")
+                            .reset_index()
+                        )
+
+                        recent = (
+                            today_df.tail(N)
+                            .merge(base_stats, on="time_of_day", how="left")
+                        )
+
+                        recent = recent[recent["baseline_mean"] > 0]
+                        if recent.empty:
+                            return (
+                                f"ℹ️ **{label}**: not enough baseline data for "
+                                "a reliable comparison."
+                            )
+
+                        actual = recent[col].mean()
+                        base_mean = recent["baseline_mean"].mean()
+                        if base_mean <= 0:
+                            return (
+                                f"ℹ️ **{label}**: baseline is zero; cannot compare yet."
+                            )
+
+                        dev_pct = (actual - base_mean) / base_mean
+                        dev_abs = abs(dev_pct)
+                        arrow = "above" if dev_pct > 0 else "below"
+
+                        if dev_abs < normal_tol:
+                            icon = "🟢"
+                            msg = "within normal range"
+                        elif dev_abs < warn_tol:
+                            icon = "🟡"
+                            msg = "slightly out of range"
+                        else:
+                            icon = "⚠️"
+                            msg = "significantly out of range"
+
+                        return (
+                            f"{icon} **{label}** is {dev_pct:+.0%} {arrow} its 7-day norm "
+                            f"over the last {N} intervals ({msg})."
+                        )
+
+                    # AHT & ACW messages
+                    aht_msg = summarize_metric("aht_eff_seconds", "AHT")
+                    acw_msg = summarize_metric("avg_acw_seconds", "ACW")
+
+                    # Arrivals: slightly different thresholds & wording
+                    def summarize_arrivals(normal_tol=0.15, warn_tol=0.30):
+                        base_stats = (
+                            baseline.groupby("time_of_day")["arrivals"]
+                            .mean()
+                            .rename("baseline_mean")
+                            .reset_index()
+                        )
+
+                        recent = (
+                            today_df.tail(N)
+                            .merge(base_stats, on="time_of_day", how="left")
+                        )
+                        recent = recent[recent["baseline_mean"] > 0]
+                        if recent.empty:
+                            return (
+                                "ℹ️ **Arrivals**: not enough baseline data for "
+                                "a reliable comparison."
+                            )
+
+                        actual = recent["arrivals"].mean()
+                        base_mean = recent["baseline_mean"].mean()
+                        dev_pct = (actual - base_mean) / base_mean
+                        dev_abs = abs(dev_pct)
+                        arrow = "above" if dev_pct > 0 else "below"
+
+                        if dev_abs < normal_tol:
+                            icon = "🟢"
+                            msg = "near expected demand"
+                        elif dev_abs < warn_tol:
+                            icon = "🟡"
+                            msg = "moderately off forecast"
+                        else:
+                            icon = "⚠️"
+                            msg = "demand surge" if dev_pct > 0 else "demand drop"
+
+                        return (
+                            f"{icon} **Arrivals** are {dev_pct:+.0%} {arrow} expected "
+                            f"over the last {N} intervals ({msg})."
+                        )
+
+                    arrivals_msg = summarize_arrivals()
+
+                    # Drift score trend from detected events
+                    if events_window.empty:
+                        drift_msg = (
+                            "ℹ️ **Drift score**: no sustained drift events detected "
+                            "in the last 7 days."
+                        )
+                    else:
+                        recent_events = events_window.sort_values("event_ts").tail(5)
+                        last_score = recent_events["score"].iloc[-1]
+                        first_score = recent_events["score"].iloc[0]
+                        delta_score = last_score - first_score
+
+                        if last_score < 2.5:
+                            icon = "🔵"
+                            trend_text = "low and stable"
+                        elif last_score < 3.5:
+                            if delta_score >= 0:
+                                icon = "🟡"
+                                trend_text = "moderate and slightly rising"
+                            else:
+                                icon = "🟡"
+                                trend_text = "moderate and easing"
+                        else:
+                            if delta_score > 0:
+                                icon = "⚠️"
+                                trend_text = "elevated and rising"
+                            else:
+                                icon = "🟠"
+                                trend_text = "elevated but easing"
+
+                        drift_msg = (
+                            f"{icon} **Drift score** is {last_score:.1f} and "
+                            f"{trend_text} over the last {len(recent_events)} events."
+                        )
+
+                    # Layout: 2 columns of text alerts
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown(aht_msg)
+                        st.markdown(acw_msg)
+                    with c2:
+                        st.markdown(arrivals_msg)
+                        st.markdown(drift_msg)
+
+        # --- 7-day Contribution Breakdown (Δ vs baseline) ---
+        st.subheader("7-Day Contribution Breakdown (Δ vs baseline)")
+
+        df_why["day"] = df_why["interval_start"].dt.date
+        days = sorted(df_why["day"].unique())
+
+        if len(days) < 2:
+            st.info("Not enough days of data to compute a multi-day contribution breakdown.")
+        else:
+            last_day = days[-1]
+            # Baseline = up to 6 previous days (or all previous if fewer)
+            previous_days = [d for d in days if d < last_day]
+            baseline_days = previous_days[-6:] if len(previous_days) > 0 else []
+
+            if len(baseline_days) == 0:
+                st.info("Only one day of data available; showing simple previous-vs-today view.")
+                # Fallback: previous day vs today (if it exists)
+                if len(days) >= 2:
+                    prev_day = days[-2]
+                    daily = (
+                        df_why.groupby("day")[["avg_aht_seconds", "avg_acw_seconds", "arrivals"]]
+                        .mean()
+                    )
+                    contrib = (
+                        daily.loc[last_day] - daily.loc[prev_day]
+                    ).rename(
+                        {
+                            "avg_aht_seconds": "ΔAHT",
+                            "avg_acw_seconds": "ΔACW",
+                            "arrivals": "ΔArrivals",
+                        }
+                    )
+                else:
+                    contrib = pd.Series(dtype=float)
+            else:
+                daily = (
+                    df_why.groupby("day")[["avg_aht_seconds", "avg_acw_seconds", "arrivals"]]
+                    .mean()
+                )
+                baseline_mean = daily.loc[baseline_days].mean()
+                today_vals = daily.loc[last_day]
+
+                contrib = (today_vals - baseline_mean).rename(
+                    {
+                        "avg_aht_seconds": "ΔAHT (vs baseline)",
+                        "avg_acw_seconds": "ΔACW (vs baseline)",
+                        "arrivals": "ΔArrivals (vs baseline)",
+                    }
+                )
+
+            if contrib.empty:
+                st.info("No contribution breakdown available yet.")
+            else:
+                # Waterfall-style contribution view: how today's averages differ from baseline
+                components = list(contrib.index)
+                values = contrib.values
+
+                # Clean display labels (strip "(vs baseline)" if present)
+                display_labels = [
+                    name.replace("(vs baseline)", "").strip()
+                    for name in components
+                ]
+
+                total_delta = float(contrib.sum())
+
+                fig_contrib = go.Figure(
+                    go.Waterfall(
+                        name="Δ vs baseline",
+                        orientation="v",
+                        x=display_labels + ["Net Δ"],
+                        measure=["relative"] * len(values) + ["total"],
+                        y=list(values) + [total_delta],
+                        text=[f"{v:+.1f}" for v in values] + [f"{total_delta:+.1f}"],
+                        textposition="outside",
+                    )
+                )
+
+                fig_contrib.update_layout(
+                    title=f"7-Day Contribution Breakdown for {last_day}",
+                    showlegend=False,
+                    margin=dict(l=40, r=40, t=60, b=40),
+                    yaxis_title="Δ vs baseline (today - 7-day baseline)",
+                )
+
+                st.plotly_chart(fig_contrib, use_container_width=True)
+
+                # --- Estimated SLA impact (today vs 7-day baseline) ---
+                try:
+                    # We only do this when we have at least one baseline day
+                    if len(baseline_days) > 0:
+                        daily_sla = compute_daily_modeled_sla(DB)
+                        if daily_sla.empty:
+                            raise ValueError("No modeled SLA data available")
+
+                        # Restrict baseline_days to days that exist in the modeled SLA series
+                        baseline_sla = daily_sla[daily_sla.index.isin(baseline_days)]
+                        if baseline_sla.empty or last_day not in daily_sla.index:
+                            raise ValueError("Insufficient SLA history for attribution")
+
+                        sla_today = float(daily_sla.loc[last_day])
+                        sla_baseline = float(baseline_sla.mean())
+                        delta_sla = sla_today - sla_baseline
+
+                        abs_contrib = contrib.abs()
+                        total_abs = float(abs_contrib.sum())
+
+                        if total_abs > 0:
+                            weights = abs_contrib / total_abs
+                            sla_contrib = weights * delta_sla
+
+                            st.markdown("**Estimated SLA impact vs 7-day baseline (last day)**")
+
+                            # Nice, readable bullets
+                            for name, val in sla_contrib.items():
+                                label = name.replace("(vs baseline)", "").strip()
+                                st.markdown(f"- **{label}**: {val:+.1f} pts")
+
+                            st.markdown(
+                                f"- **Net change in SLA**: {delta_sla:+.1f} pts "
+                                f"(modeled SLA {sla_today:.1f}% vs baseline {sla_baseline:.1f}%)"
+                            )
+                        else:
+                            st.caption(
+                                "Estimated SLA impact: metric deltas are negligible vs baseline."
+                            )
+                except Exception:
+                    # Keep this silent in UI; just avoid breaking the tab
+                    st.caption(
+                        "Estimated SLA impact could not be computed with the current data window."
+                    )
+
+        # --- Forecast Deviations (today vs 7-day band) ---
+        st.subheader("Forecast Deviations (Today vs 7-day band)")
+
+        # Need at least 2 days of data and at least 1 baseline day
+        if len(days) < 2:
+            st.info("Not enough days of data to build an expected band for today.")
+        else:
+            last_day = days[-1]
+            previous_days = [d for d in days if d < last_day]
+            baseline_days = previous_days[-6:] if len(previous_days) > 0 else []
+
+            if len(baseline_days) == 0:
+                st.info("Only one day of data available; cannot build a 7-day baseline band yet.")
+            else:
+                # Map UI labels to column names
+                metric_options = {
+                    "AHT eff (sec)": "aht_eff_seconds",
+                    "ACW (sec)": "avg_acw_seconds",
+                    "Arrivals": "arrivals",
+                }
+                metric_label = st.selectbox(
+                    "Metric",
+                    options=list(metric_options.keys()),
+                    help="Compare today's intervals against a band built from the last 7 days at the same time-of-day.",
+                )
+                metric_col = metric_options[metric_label]
+
+                # Add time-of-day so we can align intervals across days
+                df_why["time_of_day"] = df_why["interval_start"].dt.time
+
+                baseline = df_why[df_why["day"].isin(baseline_days)].copy()
+                today_df = df_why[df_why["day"] == last_day].copy()
+
+                if today_df.empty or baseline.empty:
+                    st.info("Not enough data for today or baseline to compute forecast deviations.")
+                else:
+                    # Baseline mean/std by time-of-day
+                    baseline_stats = (
+                        baseline.groupby("time_of_day")[metric_col]
+                        .agg(["mean", "std"])
+                        .rename(columns={"mean": "metric_mean", "std": "metric_std"})
+                        .reset_index()
+                    )
+
+                    # Join baseline stats onto today's intervals
+                    today_df["time_of_day"] = today_df["interval_start"].dt.time
+                    dev = today_df.merge(
+                        baseline_stats,
+                        on="time_of_day",
+                        how="left",
+                    )
+
+                    # Handle cases with no variance / missing stats
+                    dev["metric_std"] = dev["metric_std"].fillna(0.0)
+                    dev["metric_mean"] = dev["metric_mean"].fillna(dev[metric_col].mean())
+
+                    band_k = 2.0  # ~95% band
+                    dev["lower"] = dev["metric_mean"] - band_k * dev["metric_std"]
+                    dev["upper"] = dev["metric_mean"] + band_k * dev["metric_std"]
+
+                    dev["is_anomaly"] = (dev[metric_col] < dev["lower"]) | (
+                        dev[metric_col] > dev["upper"]
+                    )
+
+                    # Summary line
+                    total_intervals = len(dev)
+                    anomaly_count = int(dev["is_anomaly"].sum())
+                    anomaly_pct = (anomaly_count / total_intervals * 100.0) if total_intervals > 0 else 0.0
+                    st.caption(
+                        f"Today: {anomaly_count} / {total_intervals} intervals "
+                        f"({anomaly_pct:.1f}%) for **{metric_label}** were outside the 2σ band "
+                        f"built from the last {len(baseline_days)} day(s)."
+                    )
+
+                    # Plot: band + actual + anomaly markers
+                    fig_dev = go.Figure()
+
+                    # Upper band
+                    fig_dev.add_trace(
+                        go.Scatter(
+                            x=dev["interval_start"],
+                            y=dev["upper"],
+                            name="Upper band (mean + 2σ)",
+                            mode="lines",
+                            line=dict(width=0),
+                            showlegend=False,
+                            hoverinfo="skip",
+                        )
+                    )
+
+                    # Lower band (fill to previous)
+                    fig_dev.add_trace(
+                        go.Scatter(
+                            x=dev["interval_start"],
+                            y=dev["lower"],
+                            name="Expected band",
+                            mode="lines",
+                            line=dict(width=0),
+                            fill="tonexty",
+                            opacity=0.2,
+                            hoverinfo="skip",
+                        )
+                    )
+
+                    # Actuals
+                    fig_dev.add_trace(
+                        go.Scatter(
+                            x=dev["interval_start"],
+                            y=dev[metric_col],
+                            name="Actual",
+                            mode="lines+markers",
+                        )
+                    )
+
+                    # Anomaly markers
+                    anomalies = dev[dev["is_anomaly"]]
+                    if not anomalies.empty:
+                        fig_dev.add_trace(
+                            go.Scatter(
+                                x=anomalies["interval_start"],
+                                y=anomalies[metric_col],
+                                name="Out-of-band",
+                                mode="markers",
+                                marker=dict(size=8, symbol="circle-open"),
+                            )
+                        )
+
+                    fig_dev.update_layout(
+                        title=f"{metric_label}: Today vs 7-day expected band",
+                        hovermode="x unified",
+                        margin=dict(l=40, r=40, t=60, b=40),
+                        yaxis_title=metric_label,
+                        xaxis_title="Interval start (today)",
+                    )
+
+                    st.plotly_chart(fig_dev, use_container_width=True)
 
 # --- WHAT-IF TAB ---
 with tab_whatif:
@@ -219,8 +763,28 @@ with tab_whatif:
         columns={"sla_attainment_pct": "sla_scenario"}
     )
 
-    merged = base[["interval_start", "sla_base"]].merge(
-        out[["interval_start", "sla_scenario", "agents", "aht_eff_seconds"]],
+    base_for_merge = base.rename(
+        columns={
+            "agents": "agents_base",
+            "aht_eff_seconds": "aht_base",
+            "arrivals": "arrivals_base",
+        }
+    )
+
+    scenario_for_merge = out.rename(
+        columns={
+            "agents": "agents_scenario",
+            "aht_eff_seconds": "aht_scenario",
+            "arrivals": "arrivals_scenario",
+        }
+    )
+
+    merged = base_for_merge[
+        ["interval_start", "sla_base", "agents_base", "aht_base", "arrivals_base"]
+    ].merge(
+        scenario_for_merge[
+            ["interval_start", "sla_scenario", "agents_scenario", "aht_scenario", "arrivals_scenario"]
+        ],
         on="interval_start",
         how="inner",
     )
@@ -228,12 +792,62 @@ with tab_whatif:
     # --- Focus on "today" only (last calendar date) ---
     merged["day"] = merged["interval_start"].dt.date
     today = merged["day"].max()
+
+    # --- Derived capacity / utilization / risk (baseline & scenario) ---
+    # Offered (we treat scenario arrivals as "offered" volume)
+    merged["offered_scenario"] = merged["arrivals_scenario"]
+
+    # Safe guards for divisions
+    base_valid = (merged["agents_base"] > 0) & (merged["aht_base"] > 0)
+    scen_valid = (merged["agents_scenario"] > 0) & (merged["aht_scenario"] > 0)
+
+    # Initialize columns
+    merged["util_base"] = 0.0
+    merged["util_scenario"] = 0.0
+    merged["capacity_scenario"] = 0.0
+
+    # Baseline utilization (ρ_base)
+    merged.loc[base_valid, "util_base"] = (
+        (merged.loc[base_valid, "arrivals_base"] / 30.0)  # λ_base per minute
+        / (
+            (60.0 / merged.loc[base_valid, "aht_base"])     # μ_base per agent
+            * merged.loc[base_valid, "agents_base"]         # total capacity in services/min
+        )
+    )
+
+    # Scenario capacity and utilization (ρ_scenario)
+    merged.loc[scen_valid, "capacity_scenario"] = (
+        (60.0 / merged.loc[scen_valid, "aht_scenario"])    # μ_scenario per agent
+        * merged.loc[scen_valid, "agents_scenario"]
+        * 30.0                                             # 30-minute window
+    )
+
+    merged.loc[scen_valid, "util_scenario"] = (
+        (merged.loc[scen_valid, "arrivals_scenario"] / 30.0)  # λ_scenario per minute
+        / (
+            (60.0 / merged.loc[scen_valid, "aht_scenario"])
+            * merged.loc[scen_valid, "agents_scenario"]
+        )
+    )
+
+    # Risk index (0–100) based on scenario utilization
+    rho_safe = 0.85
+    rho_max = 1.15
+    raw_risk = (merged["util_scenario"] - rho_safe) / (rho_max - rho_safe)
+    merged["risk_index"] = raw_risk.clip(lower=0.0, upper=1.0) * 100.0
+
+    # Now slice to today
     today_df = merged[merged["day"] == today].copy()
 
     # --- Delta cards (today baseline vs scenario) ---
     base_today = today_df["sla_base"].mean()
     scenario_today = today_df["sla_scenario"].mean()
     delta_today = scenario_today - base_today
+
+    # --- At-risk intervals mask (scenario vs SLA target) ---
+    # Any interval where scenario SLA drops below the target is considered "at risk".
+    at_risk = today_df[
+    (today_df["sla_base"] < SLA_TARGET) | (today_df["sla_scenario"] < SLA_TARGET)].copy()
 
     k1, k2, k3 = st.columns(3)
     k1.metric(
@@ -251,10 +865,39 @@ with tab_whatif:
         help="Scenario staffing change vs baseline.",
     )
 
+    # --- Utilization cards (today) ---
+    util_base_today = today_df["util_base"].mean() * 100.0
+    util_scen_today = today_df["util_scenario"].mean() * 100.0
+    peak_util_scen = today_df["util_scenario"].max() * 100.0
+
+    u1, u2, u3 = st.columns(3)
+    u1.metric(
+        "Avg Util (baseline, today)",
+        f"{util_base_today:.1f}%",
+    )
+    u2.metric(
+        "Avg Util (scenario, today)",
+        f"{util_scen_today:.1f}%",
+        help="Average scenario utilization across today's intervals.",
+    )
+    u3.metric(
+        "Peak Util (scenario, today)",
+        f"{peak_util_scen:.1f}%",
+        help="Highest scenario utilization across today's intervals.",
+    )
+
     st.subheader("Preview of Projected Data (Baseline vs Scenario)")
     st.dataframe(
         merged[
-            ["interval_start", "agents", "aht_eff_seconds", "sla_base", "sla_scenario"]
+            [
+                "interval_start",
+                "agents_base",
+                "agents_scenario",
+                "aht_base",
+                "aht_scenario",
+                "sla_base",
+                "sla_scenario",
+            ]
         ].head(10),
         use_container_width=True,
     )
@@ -284,18 +927,67 @@ with tab_whatif:
         f"(**Δ:** {delta_today:+.1f} pts)"
     )
 
+    # --- Load vs Capacity (scenario, today) ---
+    st.subheader("Load vs Capacity (scenario, today)")
+
+    load_view = today_df[
+        [
+            "interval_start",
+            "offered_scenario",
+            "capacity_scenario",
+            "util_scenario",
+            "risk_index",
+        ]
+    ].copy()
+
+    load_view = load_view.rename(
+        columns={
+            "offered_scenario": "Offered",
+            "capacity_scenario": "Capacity (30m)",
+            "util_scenario": "Utilization",
+            "risk_index": "Risk index",
+        }
+    )
+
+    # Convert utilization from fraction to %
+    load_view["Utilization"] = (load_view["Utilization"] * 100.0).round(1)
+    load_view["Capacity (30m)"] = load_view["Capacity (30m)"].round(1)
+    load_view["Risk index"] = load_view["Risk index"].round(1)
+
+    st.dataframe(
+        load_view.sort_values("interval_start"),
+        use_container_width=True,
+    )
+
     # --- At-risk intervals (scenario view) ---
-    st.subheader(f"At-risk intervals (Scenario < {SLA_TARGET:.0f}% SLA)")
-
-    at_risk = today_df[today_df["sla_scenario"] < SLA_TARGET].copy()
-
     if at_risk.empty:
         st.success("No intervals below the SLA target under this scenario. ✅")
     else:
         # Keep only a few key columns for readability
         at_risk_view = at_risk[
-            ["interval_start", "agents", "aht_eff_seconds", "sla_base", "sla_scenario"]
+            [
+                "interval_start",
+                "agents_base",
+                "agents_scenario",
+                "aht_base",
+                "aht_scenario",
+                "sla_base",
+                "sla_scenario",
+                "risk_index",
+            ]
         ].sort_values("interval_start")
+
+        at_risk_view = at_risk_view.rename(
+            columns={
+                "agents_base": "Agents (base)",
+                "agents_scenario": "Agents (scenario)",
+                "aht_base": "AHT base (sec)",
+                "aht_scenario": "AHT scenario (sec)",
+                "sla_base": "SLA base (%)",
+                "sla_scenario": "SLA scenario (%)",
+                "risk_index": "Risk index",
+            }
+        )
 
         st.dataframe(
             at_risk_view,
