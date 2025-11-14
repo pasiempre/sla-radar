@@ -20,6 +20,37 @@ ROOT = Path(__file__).resolve().parents[2]
 DB = ROOT / "data" / "warehouse.db"
 REPORTS = ROOT / "data" / "reports" / "ops_brief.pdf"
 
+SLA_TARGET = 80.0
+
+# Predefined scenario presets for the What-If tab
+PRESETS = {
+    "Custom (freeform)": {
+        "extra_agents": None,
+        "acw_red": None,
+        "fcr_up": None,
+    },
+    "Staffing bump: +2 agents": {
+        "extra_agents": 2,
+        "acw_red": 0,
+        "fcr_up": 0,
+    },
+    "ACW discipline: +10% fewer ACW seconds": {
+        "extra_agents": 0,
+        "acw_red": 10,   # +10% = less ACW (better)
+        "fcr_up": 0,
+    },
+    "FCR uplift: +5%": {
+        "extra_agents": 0,
+        "acw_red": 0,
+        "fcr_up": 5,
+    },
+    "Balanced improvement: +2 agents, +5% ACW reduction, +5% FCR": {
+        "extra_agents": 2,
+        "acw_red": 5,
+        "fcr_up": 5,
+    },
+}
+
 @st.cache_data(show_spinner=False)
 def load_interval_inputs():
     con = sqlite3.connect(DB)
@@ -52,7 +83,6 @@ with tab_radar:
     st.subheader("SLA Headline & Forecast")
     # Headline proxy: compute simple modeled SLA today with current staffing
     # (quick reuse of what_if with 0 deltas)
-    policy = 15.0
     fdf = next_day_arrivals_forecast(DB)
     fig_fc = px.line(fdf.reset_index(), x="index", y="arrivals_forecast", title="Arrivals: Next-Day Forecast")
     st.plotly_chart(fig_fc, use_container_width=True)
@@ -90,33 +120,65 @@ with tab_why:
     st.plotly_chart(fig_wf, use_container_width=True)
 
 # --- WHAT-IF TAB ---
-# --- WHAT-IF TAB ---
 with tab_whatif:
     st.subheader("Scenario Controls")
+
+    # --- Session state setup for presets + sliders ---
+    if "scenario_preset" not in st.session_state:
+        st.session_state.scenario_preset = "Custom (freeform)"
+
+    if "slider_extra_agents" not in st.session_state:
+        st.session_state.slider_extra_agents = 0
+    if "slider_acw_red" not in st.session_state:
+        st.session_state.slider_acw_red = 0
+    if "slider_fcr_up" not in st.session_state:
+        st.session_state.slider_fcr_up = 0
+
+    preset_names = list(PRESETS.keys())
+    default_preset_index = preset_names.index(st.session_state.scenario_preset)
+
+    # Choose a scenario preset (can still tweak sliders afterward)
+    preset_name = st.selectbox(
+        "Scenario preset",
+        options=preset_names,
+        index=default_preset_index,
+        help="Pick a common scenario, then fine-tune with the sliders below.",
+    )
+
+    # If preset changed, update slider state based on preset values
+    if preset_name != st.session_state.scenario_preset:
+        st.session_state.scenario_preset = preset_name
+        preset = PRESETS[preset_name]
+        if preset["extra_agents"] is not None:
+            st.session_state.slider_extra_agents = preset["extra_agents"]
+        if preset["acw_red"] is not None:
+            st.session_state.slider_acw_red = preset["acw_red"]
+        if preset["fcr_up"] is not None:
+            st.session_state.slider_fcr_up = preset["fcr_up"]
 
     c1, c2, c3, c4 = st.columns(4)
     extra_agents = c1.slider(
         "Δ agents per interval",
         min_value=-20,
         max_value=20,
-        value=0,
         step=1,
+        key="slider_extra_agents",
         help="Negative: fewer agents staffed vs baseline; positive: more agents per 30-min interval.",
     )
     acw_red = c2.slider(
         "ACW change vs baseline (%)",
         min_value=-50,
         max_value=50,
-        value=0,
         step=5,
+        key="slider_acw_red",
         help="Positive values mean *less* ACW (better). Negative values mean *more* ACW (worse).",
     )
     fcr_up = c3.slider(
         "FCR change vs baseline (%)",
         min_value=-20,
         max_value=20,
-        value=0,
         step=2,
+        key="slider_fcr_up",
         help="Positive values increase FCR (fewer re-contacts). Negative values reduce FCR.",
     )
     ot_rate = c4.number_input(
@@ -125,6 +187,14 @@ with tab_whatif:
         value=33.0,
         step=1.0,
         help="Used only for incremental cost estimates in the scenario.",
+    )
+
+    scenario_label = (
+        "Custom scenario" if preset_name == "Custom (freeform)" else preset_name
+    )
+    st.caption(
+        f"Scenario: {scenario_label} — Δ agents = {extra_agents:+d}, "
+        f"ACW change = {acw_red:+.0f}%, FCR change = {fcr_up:+.0f}%."
     )
 
     # --- Baseline (no changes) ---
@@ -155,13 +225,14 @@ with tab_whatif:
         how="inner",
     )
 
-    # --- Delta cards (today baseline vs scenario) ---
+    # --- Focus on "today" only (last calendar date) ---
     merged["day"] = merged["interval_start"].dt.date
-    last_day = merged["day"].max()
-    today_mask = merged["day"] == last_day
+    today = merged["day"].max()
+    today_df = merged[merged["day"] == today].copy()
 
-    base_today = merged.loc[today_mask, "sla_base"].mean()
-    scenario_today = merged.loc[today_mask, "sla_scenario"].mean()
+    # --- Delta cards (today baseline vs scenario) ---
+    base_today = today_df["sla_base"].mean()
+    scenario_today = today_df["sla_scenario"].mean()
     delta_today = scenario_today - base_today
 
     k1, k2, k3 = st.columns(3)
@@ -212,6 +283,24 @@ with tab_whatif:
         f"**Scenario mean SLA (last day):** {scenario_today:.1f}%  "
         f"(**Δ:** {delta_today:+.1f} pts)"
     )
+
+    # --- At-risk intervals (scenario view) ---
+    st.subheader(f"At-risk intervals (Scenario < {SLA_TARGET:.0f}% SLA)")
+
+    at_risk = today_df[today_df["sla_scenario"] < SLA_TARGET].copy()
+
+    if at_risk.empty:
+        st.success("No intervals below the SLA target under this scenario. ✅")
+    else:
+        # Keep only a few key columns for readability
+        at_risk_view = at_risk[
+            ["interval_start", "agents", "aht_eff_seconds", "sla_base", "sla_scenario"]
+        ].sort_values("interval_start")
+
+        st.dataframe(
+            at_risk_view,
+            use_container_width=True,
+        )
 
     # Export Ops Brief (simple HTML -> PDF)
     if st.button("Export Ops Brief (PDF)"):
