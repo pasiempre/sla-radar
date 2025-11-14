@@ -90,161 +90,137 @@ with tab_why:
     st.plotly_chart(fig_wf, use_container_width=True)
 
 # --- WHAT-IF TAB ---
+# --- WHAT-IF TAB ---
 with tab_whatif:
     st.subheader("Scenario Controls")
 
-    # Row 1: Capacity + volume + talk time
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     extra_agents = c1.slider(
         "Δ agents per interval",
         min_value=-20,
         max_value=20,
         value=0,
         step=1,
-        help="Negative: fewer agents; positive: more agents",
+        help="Negative: fewer agents staffed vs baseline; positive: more agents per 30-min interval.",
     )
-    arrivals_mult = c2.slider(
-        "Arrivals multiplier",
-        min_value=0.5,
-        max_value=1.5,
-        value=1.0,
-        step=0.05,
-        help="Scale interval arrivals up or down (e.g., 1.2 = +20% volume)",
-    )
-    aht_change = c3.slider(
-        "Talk AHT change (%)",
-        min_value=-30,
-        max_value=50,
-        value=0,
-        step=5,
-        help="Percent change in TALK time only (ACW handled separately)",
-    )
-
-    # Row 2: ACW + FCR + OT
-    c4, c5, c6 = st.columns(3)
-    acw_red = c4.slider(
-        "ACW change (%)",
+    acw_red = c2.slider(
+        "ACW change vs baseline (%)",
         min_value=-50,
         max_value=50,
         value=0,
         step=5,
-        help="Positive: less ACW (better); Negative: more ACW (worse)",
+        help="Positive values mean *less* ACW (better). Negative values mean *more* ACW (worse).",
     )
-    fcr_up = c5.slider(
-        "FCR change (%)",
+    fcr_up = c3.slider(
+        "FCR change vs baseline (%)",
         min_value=-20,
         max_value=20,
         value=0,
         step=2,
-        help="Positive: higher FCR (fewer recontacts); Negative: lower FCR",
+        help="Positive values increase FCR (fewer re-contacts). Negative values reduce FCR.",
     )
-    ot_rate = c6.number_input(
+    ot_rate = c4.number_input(
         "OT $/hour (optional)",
         min_value=0.0,
         value=33.0,
         step=1.0,
-        help="Used only for incremental OT cost estimate",
+        help="Used only for incremental cost estimates in the scenario.",
     )
 
-    # --- BASELINE (no changes) ---
+    # --- Baseline (no changes) ---
     cfg_base = WhatIfConfig(
         acw_reduction_pct=0.0,
         fcr_uplift_pct=0.0,
         extra_agents=0,
         ot_hourly=ot_rate,
-        arrivals_multiplier=1.0,
-        aht_change_pct=0.0,
-        target_minutes_override=None,
     )
     base = simulate_what_if(cfg_base, db=DB).rename(
-        columns={
-            "sla_attainment_pct": "sla_base",
-            "utilization_rho": "rho_base",
-        }
+        columns={"sla_attainment_pct": "sla_base"}
     )
 
-    # --- SCENARIO (user sliders) ---
+    # --- Scenario (user controls) ---
     cfg = WhatIfConfig(
         acw_reduction_pct=acw_red,
         fcr_uplift_pct=fcr_up,
         extra_agents=extra_agents,
         ot_hourly=ot_rate,
-        arrivals_multiplier=arrivals_mult,
-        aht_change_pct=aht_change,
-        target_minutes_override=None,
     )
-    scenario = simulate_what_if(cfg, db=DB).rename(
-        columns={
-            "sla_attainment_pct": "sla_scenario",
-            "utilization_rho": "rho_scenario",
-        }
+    out = simulate_what_if(cfg, db=DB).rename(
+        columns={"sla_attainment_pct": "sla_scenario"}
     )
 
-    merged = base[["interval_start", "sla_base", "rho_base"]].merge(
-        scenario[
-            ["interval_start", "sla_scenario", "rho_scenario", "agents", "aht_eff_seconds"]
-        ],
+    merged = base[["interval_start", "sla_base"]].merge(
+        out[["interval_start", "sla_scenario", "agents", "aht_eff_seconds"]],
         on="interval_start",
         how="inner",
+    )
+
+    # --- Delta cards (today baseline vs scenario) ---
+    merged["day"] = merged["interval_start"].dt.date
+    last_day = merged["day"].max()
+    today_mask = merged["day"] == last_day
+
+    base_today = merged.loc[today_mask, "sla_base"].mean()
+    scenario_today = merged.loc[today_mask, "sla_scenario"].mean()
+    delta_today = scenario_today - base_today
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric(
+        "Baseline SLA (today)",
+        f"{base_today:.1f}%",
+    )
+    k2.metric(
+        "Scenario SLA (today)",
+        f"{scenario_today:.1f}%",
+        delta=f"{delta_today:+.1f} pts",
+    )
+    k3.metric(
+        "Δ agents per interval",
+        f"{extra_agents:+d}",
+        help="Scenario staffing change vs baseline.",
     )
 
     st.subheader("Preview of Projected Data (Baseline vs Scenario)")
     st.dataframe(
         merged[
-            [
-                "interval_start",
-                "agents",
-                "aht_eff_seconds",
-                "rho_base",
-                "rho_scenario",
-                "sla_base",
-                "sla_scenario",
-            ]
-        ].head(16),
+            ["interval_start", "agents", "aht_eff_seconds", "sla_base", "sla_scenario"]
+        ].head(10),
         use_container_width=True,
     )
 
     st.subheader("Projected SLA by Interval")
+
+    # Use nicer legend labels
+    plot_df = merged.rename(
+        columns={
+            "sla_base": "Baseline SLA",
+            "sla_scenario": "Scenario SLA",
+        }
+    )
+
     fig_sla = px.line(
-        merged,
+        plot_df,
         x="interval_start",
-        y=["sla_base", "sla_scenario"],
+        y=["Baseline SLA", "Scenario SLA"],
         title="SLA Attainment %: Baseline vs Scenario",
         labels={"value": "SLA %", "variable": "Curve"},
     )
     st.plotly_chart(fig_sla, use_container_width=True)
 
-    # Quick utilization view – helps explain why SLA may not move much
-    st.subheader("Scenario Utilization (ρ) by Interval")
-    fig_rho = px.line(
-        merged,
-        x="interval_start",
-        y=["rho_base", "rho_scenario"],
-        title="Utilization ρ: Baseline vs Scenario",
-        labels={"value": "ρ", "variable": "Curve"},
+    st.write(
+        f"**Baseline mean SLA (last day):** {base_today:.1f}%  "
+        f"**Scenario mean SLA (last day):** {scenario_today:.1f}%  "
+        f"(**Δ:** {delta_today:+.1f} pts)"
     )
-    st.plotly_chart(fig_rho, use_container_width=True)
-
-    # Headline stats for the last "day" worth of intervals (tail 16)
-    last_n = 16
-    base_mean = merged["sla_base"].tail(last_n).mean()
-    scen_mean = merged["sla_scenario"].tail(last_n).mean()
-    scen_rho_max = merged["rho_scenario"].tail(last_n).max()
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Baseline mean SLA (last day)", f"{base_mean:.1f}%")
-    m2.metric("Scenario mean SLA (last day)", f"{scen_mean:.1f}%")
-    m3.metric("Scenario max ρ (last day)", f"{scen_rho_max:.2f}")
 
     # Export Ops Brief (simple HTML -> PDF)
     if st.button("Export Ops Brief (PDF)"):
         html = f"""
         <h1>SLA Ops Brief</h1>
-        <p><b>Scenario:</b> Δ agents={extra_agents}, Arrivals×={arrivals_mult},
-           Talk AHT {aht_change}%, ACW {acw_red}%, FCR {fcr_up}%</p>
-        <p>Baseline mean SLA (last day): {base_mean:.1f}%</p>
-        <p>Scenario mean SLA (last day): {scen_mean:.1f}%</p>
-        <p>Scenario max utilization ρ (last day): {scen_rho_max:.2f}</p>
+        <p><b>Scenario:</b> Δ agents={extra_agents}, ACW {acw_red}%, FCR {fcr_up}%</p>
+        <p>Baseline mean SLA (last day): {base_today:.1f}%</p>
+        <p>Scenario mean SLA (last day): {scenario_today:.1f}%</p>
+        <p>Delta: {delta_today:+.1f} percentage points</p>
         """
         path = export_ops_brief(html, REPORTS)
         st.success(f"Exported: {path}")
