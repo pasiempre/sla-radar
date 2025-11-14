@@ -95,25 +95,231 @@ def compute_daily_modeled_sla(db: Path) -> pd.Series:
     return daily_sla
 
 
-st.set_page_config(page_title="SLA Drift Radar", layout="wide")
-st.title("SLA Drift Radar & Staffing What-Ifs")
+st.set_page_config(page_title="Support Analytics Dashboard", layout="wide")
+st.title("Support Analytics Dashboard")
 
 tab_radar, tab_why, tab_whatif = st.tabs(["📡 Radar (Today)", "🔍 Why (Drift)", "🧮 What-If"])
 
 # --- RADAR TAB ---
 with tab_radar:
-    df = load_interval_inputs()
-    st.subheader("SLA Headline & Forecast")
-    # Headline proxy: compute simple modeled SLA today with current staffing
-    # (quick reuse of what_if with 0 deltas)
-    fdf = next_day_arrivals_forecast(DB)
-    fig_fc = px.line(fdf.reset_index(), x="index", y="arrivals_forecast", title="Arrivals: Next-Day Forecast")
-    st.plotly_chart(fig_fc, use_container_width=True)
+    st.subheader("📡 Radar: Today at a Glance")
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("AHT (sec)", f"{df['avg_aht_seconds'].tail(16).mean():.0f}")
-    k2.metric("ACW (sec)", f"{df['avg_acw_seconds'].tail(16).mean():.0f}")
-    k3.metric("FCR (%)", f"{df['fcr_pct'].tail(16).mean():.1f}")
+    df_all = load_interval_inputs()
+    if df_all.empty:
+        st.info("No interval data available yet for the Radar view.")
+    else:
+        # Add calendar day for grouping
+        df_all["day"] = df_all["interval_start"].dt.date
+        days = sorted(df_all["day"].unique())
+
+        if len(days) == 0:
+            st.info("No dated interval data available for the Radar view.")
+        else:
+            today = days[-1]
+            previous_days = [d for d in days if d < today]
+            baseline_days = previous_days[-6:] if previous_days else []
+
+            # --------------------------
+            # 1) SLA Headline Strip
+            # --------------------------
+            st.markdown("### SLA Headline (modeled)")
+
+            daily_sla = compute_daily_modeled_sla(DB)
+            if daily_sla.empty or today not in daily_sla.index:
+                st.info(
+                    "Modeled daily SLA is not available yet; "
+                    "headline SLA metrics will appear once data is populated."
+                )
+            else:
+                sla_today = float(daily_sla.loc[today])
+
+                # Yesterday (if available in modeled SLA series)
+                delta_vs_yesterday = None
+                if previous_days:
+                    yesterday = previous_days[-1]
+                    if yesterday in daily_sla.index:
+                        sla_yesterday = float(daily_sla.loc[yesterday])
+                        delta_vs_yesterday = sla_today - sla_yesterday
+
+                # 7-day baseline (modeled SLA)
+                baseline_sla_days = [d for d in baseline_days if d in daily_sla.index]
+                delta_vs_baseline = None
+                if baseline_sla_days:
+                    sla_baseline = float(daily_sla.loc[baseline_sla_days].mean())
+                    delta_vs_baseline = sla_today - sla_baseline
+                else:
+                    sla_baseline = None
+
+                c1, c2, c3 = st.columns(3)
+
+                # Today SLA
+                if delta_vs_yesterday is not None:
+                    c1.metric(
+                        "SLA (today, modeled)",
+                        f"{sla_today:.1f}%",
+                        delta=f"{delta_vs_yesterday:+.1f} pts vs yesterday",
+                    )
+                else:
+                    c1.metric("SLA (today, modeled)", f"{sla_today:.1f}%")
+
+                # Vs 7-day baseline
+                if delta_vs_baseline is not None and sla_baseline is not None:
+                    c2.metric(
+                        "Δ vs 7-day baseline",
+                        f"{delta_vs_baseline:+.1f} pts",
+                        help=f"Baseline modeled SLA: {sla_baseline:.1f}%",
+                    )
+                else:
+                    c2.metric(
+                        "Δ vs 7-day baseline",
+                        "n/a",
+                        help="Not enough modeled SLA history for a 7-day baseline.",
+                    )
+
+                # Target status
+                if sla_today >= SLA_TARGET:
+                    icon = "🟢"
+                    status = "On target"
+                elif sla_today >= SLA_TARGET - 5:
+                    icon = "🟡"
+                    status = "Slightly below target"
+                else:
+                    icon = "🔴"
+                    status = "Off target"
+
+                c3.metric(
+                    "SLA target",
+                    f"{SLA_TARGET:.0f}%",
+                    help=f"{icon} {status} vs target.",
+                )
+
+            # --------------------------
+            # 2) KPI Cards (today vs 7-day norm)
+            # --------------------------
+            st.markdown("### Key Ops KPIs (today vs 7-day norm)")
+
+            df_today = df_all[df_all["day"] == today].copy()
+            if df_today.empty:
+                st.info("No intervals found for today yet.")
+            else:
+                baseline_df = (
+                    df_all[df_all["day"].isin(baseline_days)].copy()
+                    if baseline_days
+                    else pd.DataFrame()
+                )
+
+                kpi_cols = st.columns(4)
+
+                def render_kpi(idx, col_name, label, fmt="{:.0f}"):
+                    col = kpi_cols[idx]
+                    today_mean = df_today[col_name].mean()
+
+                    if not baseline_df.empty and baseline_df[col_name].mean() > 0:
+                        base_mean = baseline_df[col_name].mean()
+                        pct_diff = (today_mean - base_mean) / base_mean
+                        delta_str = f"{pct_diff:+.0%} vs 7-day norm"
+                        col.metric(label, fmt.format(today_mean), delta=delta_str)
+                    else:
+                        col.metric(label, fmt.format(today_mean))
+
+                render_kpi(0, "aht_eff_seconds", "AHT eff (sec)")
+                render_kpi(1, "avg_acw_seconds", "ACW (sec)")
+                render_kpi(2, "fcr_pct", "FCR (%)", fmt="{:.1f}")
+                render_kpi(3, "arrivals", "Arrivals / 30m", fmt="{:.1f}")
+
+            # --------------------------
+            # 3) SLA Today by Interval
+            # --------------------------
+            st.markdown("### SLA Today by Interval")
+
+            try:
+                cfg_headline = WhatIfConfig(
+                    acw_reduction_pct=0.0,
+                    fcr_uplift_pct=0.0,
+                    extra_agents=0,
+                    ot_hourly=0.0,
+                )
+                sla_df = simulate_what_if(cfg_headline, db=DB)
+            except Exception:
+                sla_df = pd.DataFrame()
+
+            if sla_df.empty:
+                st.info(
+                    "Could not compute interval-level modeled SLA for today yet."
+                )
+            else:
+                sla_df["day"] = sla_df["interval_start"].dt.date
+                today_sla = sla_df[sla_df["day"] == today].copy()
+
+                if today_sla.empty:
+                    st.info("No modeled SLA intervals found for today.")
+                else:
+                    plot_sla = today_sla.rename(
+                        columns={"sla_attainment_pct": "SLA %"}
+                    )
+
+                    fig_sla = px.line(
+                        plot_sla,
+                        x="interval_start",
+                        y="SLA %",
+                        title="SLA Today by Interval (vs target)",
+                        labels={"interval_start": "Interval start"},
+                    )
+
+                    # Add target line
+                    fig_sla.add_trace(
+                        go.Scatter(
+                            x=plot_sla["interval_start"],
+                            y=[SLA_TARGET] * len(plot_sla),
+                            name=f"SLA target ({SLA_TARGET:.0f}%)",
+                            mode="lines",
+                            line=dict(dash="dash"),
+                        )
+                    )
+
+                    fig_sla.update_layout(
+                        hovermode="x unified",
+                        margin=dict(l=40, r=40, t=60, b=40),
+                    )
+
+                    st.plotly_chart(fig_sla, use_container_width=True)
+
+            # --------------------------
+            # 4) Arrivals Forecast
+            # --------------------------
+            st.markdown("### Arrivals Forecast")
+
+            try:
+                fdf = next_day_arrivals_forecast(DB)
+            except Exception:
+                fdf = pd.DataFrame()
+
+            if fdf is None or len(fdf) == 0:
+                st.info("Arrivals forecast is not available yet.")
+            else:
+                fc_plot = fdf.reset_index().rename(
+                    columns={"index": "interval_start"}
+                )
+                fig_fc = px.line(
+                    fc_plot,
+                    x="interval_start",
+                    y="arrivals_forecast",
+                    title="Arrivals forecast (next day, avg per 30m)",
+                    labels={
+                        "interval_start": "Forecast interval",
+                        "arrivals_forecast": "Arrivals (forecast)",
+                    },
+                )
+                fig_fc.update_layout(
+                    hovermode="x unified",
+                    margin=dict(l=40, r=40, t=60, b=40),
+                )
+                st.plotly_chart(fig_fc, use_container_width=True)
+
+                st.caption(
+                    "This shows the modeled arrivals for the next day. "
+                    "In production, intraday peaks will highlight upcoming load risk."
+                )
 
 # --- WHY TAB ---
 with tab_why:
