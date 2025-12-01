@@ -1,7 +1,0 @@
-dashboard
-features
-ingest
-loaders
-models
-reports
-scenarios

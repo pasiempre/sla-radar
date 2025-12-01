@@ -1,11 +1,20 @@
 from __future__ import annotations
 import sqlite3
+import json
+import logging
 from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
 import pandas as pd
+import numpy as np
 import streamlit as st
 import plotly.express as px
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # add project root (sla-radar/) to sys.path so "src" imports work
 import os, sys
@@ -17,12 +26,26 @@ from src.models.forecast import next_day_arrivals_forecast
 from src.models.drift import run_drift, DriftConfig
 from src.scenarios.what_if import simulate_what_if, WhatIfConfig
 from src.reports.pdf_export import export_ops_brief
+from src.models.erlangc import estimate_sla_attainment
 
 ROOT = Path(__file__).resolve().parents[2]
 DB = ROOT / "data" / "warehouse.db"
+SEED = ROOT / "data" / "seed"
 REPORTS = ROOT / "data" / "reports" / "ops_brief.pdf"
 
-SLA_TARGET = 80.0
+# =====================================================
+# CONFIGURATION - Adjust these for your environment
+# =====================================================
+SLA_TARGET = 80.0  # Default SLA target percentage
+AUTO_REFRESH_SECONDS = 300  # Auto-refresh every 5 minutes (0 to disable)
+DATA_STALENESS_MINUTES = 30  # Warn if data older than this
+TIMEZONE = "America/New_York"  # Display timezone
+
+# Alert thresholds
+SLA_CRITICAL_THRESHOLD = 10  # pts below target = critical
+SLA_WARNING_THRESHOLD = 5    # pts below target = warning
+UTIL_WARNING_THRESHOLD = 85  # % utilization warning
+UTIL_CRITICAL_THRESHOLD = 95 # % utilization critical
 
 # Predefined scenario presets for the What-If tab
 PRESETS = {
@@ -53,10 +76,34 @@ PRESETS = {
     },
 }
 
-@st.cache_data(show_spinner=False)
-def load_interval_inputs():
-    con = sqlite3.connect(DB)
+def check_data_freshness(df: pd.DataFrame, ts_col: str = "interval_start") -> Tuple[bool, Optional[str]]:
+    """
+    Check if data is stale (older than DATA_STALENESS_MINUTES).
+    Returns (is_fresh, warning_message).
+    """
+    if df.empty or ts_col not in df.columns:
+        return False, "No data available"
+    
+    latest = pd.to_datetime(df[ts_col]).max()
+    if pd.isna(latest):
+        return False, "Could not determine data freshness"
+    
+    age_minutes = (datetime.now() - latest).total_seconds() / 60
+    if age_minutes > DATA_STALENESS_MINUTES:
+        return False, f"⚠️ Data is {age_minutes:.0f} min old (last update: {latest.strftime('%H:%M')})"
+    
+    return True, None
+
+
+@st.cache_data(show_spinner=False, ttl=60)  # Cache for 60 seconds
+def load_interval_inputs() -> pd.DataFrame:
+    """Load interval data from warehouse with proper error handling."""
+    if not DB.exists():
+        logger.warning(f"Database not found: {DB}")
+        return pd.DataFrame()
+    
     try:
+        con = sqlite3.connect(DB)
         df = pd.read_sql_query("""
             SELECT e.interval_start,
                    e.arrivals,
@@ -71,6 +118,9 @@ def load_interval_inputs():
             ORDER BY 1
         """, con, parse_dates=["interval_start"])
         return df
+    except sqlite3.Error as e:
+        logger.error(f"Database error loading intervals: {e}")
+        return pd.DataFrame()
     finally:
         con.close()
 
@@ -95,18 +145,235 @@ def compute_daily_modeled_sla(db: Path) -> pd.Series:
     return daily_sla
 
 
-st.set_page_config(page_title="Support Analytics Dashboard", layout="wide")
-st.title("Support Analytics Dashboard")
+@st.cache_data(show_spinner=False)
+def load_channel_mix() -> pd.DataFrame:
+    """Load interval_load.csv and parse mix_json for channel breakdown."""
+    path = SEED / "interval_load.csv"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path, parse_dates=["interval_start"])
+    
+    # Parse mix_json column into channel columns
+    # Format: {"channel": {"email": 0.5, "chat": 0.3, "phone": 0.2}, "issue_type": {...}}
+    def parse_mix(row):
+        try:
+            mix = json.loads(row["mix_json"]) if pd.notna(row["mix_json"]) else {}
+            # Handle nested structure: mix["channel"]["phone"] etc.
+            channel = mix.get("channel", {})
+            arrivals = row.get("arrivals", 0)
+            # Convert percentages to actual volumes
+            return pd.Series({
+                "phone": channel.get("phone", 0) * arrivals,
+                "chat": channel.get("chat", 0) * arrivals,
+                "email": channel.get("email", 0) * arrivals,
+            })
+        except (json.JSONDecodeError, TypeError):
+            return pd.Series({"phone": 0, "chat": 0, "email": 0})
+    
+    channels = df.apply(parse_mix, axis=1)
+    df = pd.concat([df, channels], axis=1)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_ops_cost() -> pd.DataFrame:
+    """Load ops_cost.csv for cost calculations."""
+    path = SEED / "ops_cost.csv"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path, parse_dates=["interval_start"])
+
+
+@st.cache_data(show_spinner=False)
+def load_sla_policy() -> dict:
+    """Load SLA policy configuration."""
+    path = SEED / "sla_policy.csv"
+    if not path.exists():
+        return {"target_minutes": 15, "target_pct": 90.0}
+    df = pd.read_csv(path)
+    if df.empty:
+        return {"target_minutes": 15, "target_pct": 90.0}
+    row = df.iloc[0]
+    return {
+        "target_minutes": float(row.get("target_minutes", 15)),
+        "target_pct": float(row.get("target_pct", 90.0)),
+    }
+
+
+def compute_staffing_recommendation(
+    arrivals: float,
+    aht_eff_minutes: float,
+    current_agents: int,
+    target_sla: float = 0.80,
+    sla_target_minutes: float = 15.0,
+) -> dict:
+    """
+    Use Erlang C to compute staffing recommendations.
+    Returns dict with recommended agents and SLA improvement.
+    """
+    if arrivals <= 0 or aht_eff_minutes <= 0:
+        return {"recommended_agents": current_agents, "delta": 0, "projected_sla": 0.0}
+    
+    # Arrival rate per minute
+    lambda_rate = arrivals / 30.0  # 30-min interval
+    
+    # Find minimum agents to meet target SLA
+    recommended = current_agents
+    for test_agents in range(max(1, current_agents - 5), current_agents + 20):
+        projected = estimate_sla_attainment(
+            lambda_rate, aht_eff_minutes, test_agents, sla_target_minutes
+        )
+        if projected >= target_sla:
+            recommended = test_agents
+            break
+    
+    # Current SLA
+    current_sla = estimate_sla_attainment(
+        lambda_rate, aht_eff_minutes, current_agents, sla_target_minutes
+    ) if current_agents > 0 else 0.0
+    
+    projected_sla = estimate_sla_attainment(
+        lambda_rate, aht_eff_minutes, recommended, sla_target_minutes
+    )
+    
+    return {
+        "recommended_agents": recommended,
+        "delta": recommended - current_agents,
+        "current_sla": current_sla * 100,
+        "projected_sla": projected_sla * 100,
+    }
+
+
+def render_sla_gauge(sla_value: float, target: float = 80.0) -> go.Figure:
+    """Create a gauge chart showing SLA health status."""
+    # Determine color based on SLA vs target
+    if sla_value >= target:
+        bar_color = "green"
+    elif sla_value >= target - 5:
+        bar_color = "gold"
+    else:
+        bar_color = "red"
+    
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number+delta",
+        value=sla_value,
+        delta={"reference": target, "suffix": " vs target"},
+        number={"suffix": "%", "font": {"size": 48}},
+        title={"text": "SLA Health", "font": {"size": 24}},
+        gauge={
+            "axis": {"range": [0, 100], "tickwidth": 1},
+            "bar": {"color": bar_color},
+            "bgcolor": "white",
+            "borderwidth": 2,
+            "bordercolor": "gray",
+            "steps": [
+                {"range": [0, target - 10], "color": "rgba(255, 0, 0, 0.2)"},
+                {"range": [target - 10, target - 5], "color": "rgba(255, 165, 0, 0.2)"},
+                {"range": [target - 5, target], "color": "rgba(255, 255, 0, 0.2)"},
+                {"range": [target, 100], "color": "rgba(0, 255, 0, 0.2)"},
+            ],
+            "threshold": {
+                "line": {"color": "black", "width": 4},
+                "thickness": 0.75,
+                "value": target,
+            },
+        },
+    ))
+    
+    fig.update_layout(
+        height=280,
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    return fig
+
+
+st.set_page_config(
+    page_title="SLA Radar - Support Analytics",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# --- Sidebar Configuration ---
+with st.sidebar:
+    st.header("⚙️ Settings")
+    
+    # SLA Target override
+    sla_target_override = st.number_input(
+        "SLA Target (%)",
+        min_value=50.0,
+        max_value=100.0,
+        value=SLA_TARGET,
+        step=1.0,
+        help="Adjust the SLA target for analysis"
+    )
+    
+    # Auto-refresh toggle
+    auto_refresh = st.checkbox(
+        "Auto-refresh",
+        value=AUTO_REFRESH_SECONDS > 0,
+        help=f"Refresh data every {AUTO_REFRESH_SECONDS} seconds"
+    )
+    
+    if auto_refresh and AUTO_REFRESH_SECONDS > 0:
+        st.caption(f"↻ Refreshing every {AUTO_REFRESH_SECONDS}s")
+        # Streamlit auto-rerun mechanism
+        import time
+        if "last_refresh" not in st.session_state:
+            st.session_state.last_refresh = time.time()
+        if time.time() - st.session_state.last_refresh > AUTO_REFRESH_SECONDS:
+            st.session_state.last_refresh = time.time()
+            st.cache_data.clear()
+            st.rerun()
+    
+    st.divider()
+    
+    # Manual refresh button
+    if st.button("🔄 Refresh Now", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    
+    # Data status
+    st.divider()
+    st.caption("📊 Data Status")
+    df_check = load_interval_inputs()
+    is_fresh, freshness_msg = check_data_freshness(df_check)
+    if is_fresh:
+        st.success("✅ Data is current")
+    else:
+        st.warning(freshness_msg or "Data may be stale")
+    
+    # Last updated timestamp
+    if not df_check.empty:
+        latest = df_check["interval_start"].max()
+        st.caption(f"Last interval: {latest.strftime('%Y-%m-%d %H:%M')}")
+
+# Use the override if set
+SLA_TARGET_ACTIVE = sla_target_override
+
+# --- Main Dashboard ---
+st.title("📡 SLA Radar Dashboard")
+st.caption(f"Real-time call center SLA monitoring | Target: {SLA_TARGET_ACTIVE:.0f}%")
 
 tab_radar, tab_why, tab_whatif = st.tabs(["📡 Radar (Today)", "🔍 Why (Drift)", "🧮 What-If"])
 
 # --- RADAR TAB ---
 with tab_radar:
     st.subheader("📡 Radar: Today at a Glance")
+    
+    # Use active SLA target (from sidebar or default)
+    SLA_TARGET = SLA_TARGET_ACTIVE
 
     df_all = load_interval_inputs()
+    
+    # Show data freshness warning if needed
+    is_fresh, freshness_msg = check_data_freshness(df_all)
+    if not is_fresh and freshness_msg:
+        st.warning(freshness_msg)
+    
     if df_all.empty:
-        st.info("No interval data available yet for the Radar view.")
+        st.error("❌ No interval data available. Please check database connection.")
+        st.info("Run the data loader to populate the warehouse: `python -m src.ingest.loader`")
     else:
         # Add calendar day for grouping
         df_all["day"] = df_all["interval_start"].dt.date
@@ -120,11 +387,59 @@ with tab_radar:
             baseline_days = previous_days[-6:] if previous_days else []
 
             # --------------------------
+            # 0) SLA Health Gauge (NEW FEATURE)
+            # --------------------------
+            daily_sla = compute_daily_modeled_sla(DB)
+            sla_policy = load_sla_policy()
+            
+            if not daily_sla.empty and today in daily_sla.index:
+                sla_today = float(daily_sla.loc[today])
+                
+                # Two-column layout: Gauge on left, status on right
+                gauge_col, status_col = st.columns([1, 1])
+                
+                with gauge_col:
+                    fig_gauge = render_sla_gauge(sla_today, target=SLA_TARGET)
+                    st.plotly_chart(fig_gauge, use_container_width=True)
+                
+                with status_col:
+                    # Status card with color-coded alert
+                    if sla_today >= SLA_TARGET:
+                        st.success(f"🟢 **SLA On Target** — {sla_today:.1f}% exceeds {SLA_TARGET:.0f}% goal")
+                        status_detail = "Operations are running smoothly. Continue monitoring for any drift."
+                    elif sla_today >= SLA_TARGET - 5:
+                        st.warning(f"🟡 **SLA At Risk** — {sla_today:.1f}% slightly below {SLA_TARGET:.0f}% goal")
+                        status_detail = "Consider reviewing staffing levels for upcoming intervals."
+                    else:
+                        st.error(f"🔴 **SLA Critical** — {sla_today:.1f}% is {SLA_TARGET - sla_today:.1f} pts below target")
+                        status_detail = "Immediate action recommended. Check staffing and queue health."
+                    
+                    st.markdown(f"*{status_detail}*")
+                    
+                    # Quick stats
+                    if previous_days:
+                        yesterday = previous_days[-1]
+                        if yesterday in daily_sla.index:
+                            sla_yesterday = float(daily_sla.loc[yesterday])
+                            trend = "📈" if sla_today > sla_yesterday else "📉" if sla_today < sla_yesterday else "➡️"
+                            st.metric(
+                                "Trend vs Yesterday",
+                                f"{sla_today - sla_yesterday:+.1f} pts",
+                                help=f"Yesterday: {sla_yesterday:.1f}%"
+                            )
+                    
+                    # Policy reference
+                    st.caption(
+                        f"📋 SLA Policy: {sla_policy['target_pct']:.0f}% within {sla_policy['target_minutes']:.0f} min"
+                    )
+                
+                st.divider()
+
+            # --------------------------
             # 1) SLA Headline Strip
             # --------------------------
             st.markdown("### SLA Headline (modeled)")
 
-            daily_sla = compute_daily_modeled_sla(DB)
             if daily_sla.empty or today not in daily_sla.index:
                 st.info(
                     "Modeled daily SLA is not available yet; "
@@ -321,24 +636,207 @@ with tab_radar:
                     "In production, intraday peaks will highlight upcoming load risk."
                 )
 
+            # --------------------------
+            # 5) Channel Mix Breakdown (NEW FEATURE)
+            # --------------------------
+            st.markdown("### Channel Mix Breakdown")
+            
+            channel_df = load_channel_mix()
+            if channel_df.empty:
+                st.info("Channel mix data not available.")
+            else:
+                channel_df["day"] = channel_df["interval_start"].dt.date
+                today_channel = channel_df[channel_df["day"] == today].copy()
+                
+                if today_channel.empty:
+                    st.info("No channel data for today.")
+                else:
+                    # Aggregate totals
+                    total_phone = today_channel["phone"].sum()
+                    total_chat = today_channel["chat"].sum()
+                    total_email = today_channel["email"].sum()
+                    total_all = total_phone + total_chat + total_email
+                    
+                    if total_all > 0:
+                        ch_col1, ch_col2 = st.columns([1, 2])
+                        
+                        with ch_col1:
+                            # Pie chart
+                            fig_pie = go.Figure(data=[go.Pie(
+                                labels=["📞 Phone", "💬 Chat", "📧 Email"],
+                                values=[total_phone, total_chat, total_email],
+                                hole=0.4,
+                                marker_colors=["#1f77b4", "#2ca02c", "#ff7f0e"],
+                            )])
+                            fig_pie.update_layout(
+                                title="Today's Volume by Channel",
+                                margin=dict(l=20, r=20, t=40, b=20),
+                                height=300,
+                                showlegend=True,
+                            )
+                            st.plotly_chart(fig_pie, use_container_width=True)
+                        
+                        with ch_col2:
+                            # Timeline by channel
+                            fig_channel = go.Figure()
+                            fig_channel.add_trace(go.Scatter(
+                                x=today_channel["interval_start"],
+                                y=today_channel["phone"],
+                                name="📞 Phone",
+                                mode="lines+markers",
+                                stackgroup="one",
+                            ))
+                            fig_channel.add_trace(go.Scatter(
+                                x=today_channel["interval_start"],
+                                y=today_channel["chat"],
+                                name="💬 Chat",
+                                mode="lines+markers",
+                                stackgroup="one",
+                            ))
+                            fig_channel.add_trace(go.Scatter(
+                                x=today_channel["interval_start"],
+                                y=today_channel["email"],
+                                name="📧 Email",
+                                mode="lines+markers",
+                                stackgroup="one",
+                            ))
+                            fig_channel.update_layout(
+                                title="Channel Volume by Interval",
+                                hovermode="x unified",
+                                margin=dict(l=40, r=40, t=60, b=40),
+                                yaxis_title="Volume",
+                            )
+                            st.plotly_chart(fig_channel, use_container_width=True)
+                        
+                        # Channel metrics
+                        mc1, mc2, mc3 = st.columns(3)
+                        mc1.metric("📞 Phone", f"{total_phone:,.0f}", f"{total_phone/total_all*100:.0f}%")
+                        mc2.metric("💬 Chat", f"{total_chat:,.0f}", f"{total_chat/total_all*100:.0f}%")
+                        mc3.metric("📧 Email", f"{total_email:,.0f}", f"{total_email/total_all*100:.0f}%")
+
+            # --------------------------
+            # 6) Interval-Level Alerts (NEW FEATURE)
+            # --------------------------
+            st.markdown("### ⚠️ Interval-Level SLA Alerts")
+            
+            if not sla_df.empty and not today_sla.empty:
+                # Find intervals at risk (below target)
+                at_risk_intervals = today_sla[today_sla["sla_attainment_pct"] < SLA_TARGET].copy()
+                
+                if at_risk_intervals.empty:
+                    st.success("✅ All intervals are meeting SLA target today!")
+                else:
+                    st.warning(f"⚠️ {len(at_risk_intervals)} interval(s) at risk or below target")
+                    
+                    # Sort by SLA (worst first)
+                    at_risk_intervals = at_risk_intervals.sort_values("sla_attainment_pct")
+                    
+                    # Show top 5 worst intervals
+                    for _, row in at_risk_intervals.head(5).iterrows():
+                        interval_time = row["interval_start"].strftime("%H:%M")
+                        sla_pct = row["sla_attainment_pct"]
+                        gap = SLA_TARGET - sla_pct
+                        
+                        if sla_pct < SLA_TARGET - 10:
+                            st.error(f"🔴 **{interval_time}** — SLA {sla_pct:.1f}% ({gap:.1f} pts below target)")
+                        elif sla_pct < SLA_TARGET - 5:
+                            st.warning(f"🟠 **{interval_time}** — SLA {sla_pct:.1f}% ({gap:.1f} pts below target)")
+                        else:
+                            st.warning(f"🟡 **{interval_time}** — SLA {sla_pct:.1f}% ({gap:.1f} pts below target)")
+                    
+                    if len(at_risk_intervals) > 5:
+                        with st.expander(f"View all {len(at_risk_intervals)} at-risk intervals"):
+                            st.dataframe(
+                                at_risk_intervals[["interval_start", "sla_attainment_pct", "arrivals", "agents"]]
+                                .rename(columns={
+                                    "sla_attainment_pct": "SLA %",
+                                    "interval_start": "Interval",
+                                }),
+                                use_container_width=True,
+                            )
+
+            # --------------------------
+            # 7) Staffing Recommendations (NEW FEATURE)
+            # --------------------------
+            st.markdown("### 📊 Staffing Recommendations")
+            
+            if not sla_df.empty and not today_sla.empty:
+                df_today_merged = today_sla.merge(
+                    df_all[df_all["day"] == today][["interval_start", "avg_aht_seconds", "avg_acw_seconds"]],
+                    on="interval_start",
+                    how="left",
+                )
+                
+                # Compute recommendations for each at-risk interval
+                recommendations = []
+                for _, row in df_today_merged.iterrows():
+                    if row["sla_attainment_pct"] < SLA_TARGET:
+                        aht_eff_min = (row.get("aht_eff_seconds", 180)) / 60.0
+                        rec = compute_staffing_recommendation(
+                            arrivals=row["arrivals"],
+                            aht_eff_minutes=aht_eff_min,
+                            current_agents=int(row["agents"]),
+                            target_sla=SLA_TARGET / 100.0,
+                            sla_target_minutes=15.0,
+                        )
+                        if rec["delta"] > 0:
+                            recommendations.append({
+                                "interval": row["interval_start"].strftime("%H:%M"),
+                                "current_agents": int(row["agents"]),
+                                "recommended": rec["recommended_agents"],
+                                "delta": rec["delta"],
+                                "current_sla": row["sla_attainment_pct"],
+                                "projected_sla": rec["projected_sla"],
+                            })
+                
+                if not recommendations:
+                    st.info("No staffing changes recommended — all intervals are on track or already optimally staffed.")
+                else:
+                    st.info(f"💡 {len(recommendations)} interval(s) could benefit from additional staffing")
+                    
+                    # Summary box
+                    rec_df = pd.DataFrame(recommendations)
+                    total_extra = rec_df["delta"].sum()
+                    avg_improvement = rec_df["projected_sla"].mean() - rec_df["current_sla"].mean()
+                    
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric("Total Extra Agents Needed", f"+{total_extra}")
+                    rc2.metric("Avg SLA Improvement", f"+{avg_improvement:.1f} pts")
+                    rc3.metric("Intervals Affected", len(recommendations))
+                    
+                    # Detailed recommendations
+                    with st.expander("View detailed recommendations"):
+                        for rec in recommendations[:10]:
+                            st.markdown(
+                                f"**{rec['interval']}**: Add **+{rec['delta']} agent(s)** "
+                                f"(current: {rec['current_agents']}) → "
+                                f"SLA improves from {rec['current_sla']:.1f}% to ~{rec['projected_sla']:.1f}%"
+                            )
+
 # --- WHY TAB ---
 with tab_why:
-    st.subheader("Drift Timeline: Metrics vs EWMA Score")
+    st.subheader("🔍 Why: Drift Detection & Root Cause Analysis")
+    st.caption("Identify what's driving SLA changes using EWMA drift detection and contribution analysis")
 
     # Load interval metrics and restrict to recent window
     df_why = load_interval_inputs().sort_values("interval_start")
     if df_why.empty:
-        st.info("No interval data available to compute drift.")
+        st.error("❌ No interval data available for drift analysis.")
+        st.info("Run the data loader to populate the warehouse: `python -m src.ingest.loader`")
     else:
         last_ts = df_why["interval_start"].max()
         cutoff = last_ts - pd.Timedelta(days=7)  # last 7 days
         ts = df_why[df_why["interval_start"] >= cutoff].copy()
 
         # Load drift events and align to same window
-        events = run_drift(DB, DriftConfig(alpha=0.3, hysteresis_k=1.8, min_run=2))
+        try:
+            events = run_drift(DB, DriftConfig(alpha=0.3, hysteresis_k=1.8, min_run=2))
+        except Exception as e:
+            logger.error(f"Error running drift detection: {e}")
+            events = pd.DataFrame()
 
         if events.empty:
-            st.info("No sustained drift events detected with current thresholds.")
+            st.success("✅ No sustained drift events detected with current thresholds.")
             events_window = pd.DataFrame()
         else:
             events_window = events.copy()
@@ -871,7 +1369,12 @@ with tab_why:
 
 # --- WHAT-IF TAB ---
 with tab_whatif:
-    st.subheader("Scenario Controls")
+    st.subheader("🧮 Scenario Simulator")
+    
+    # Use active SLA target (from sidebar)
+    SLA_TARGET = SLA_TARGET_ACTIVE
+    
+    st.caption(f"Model the impact of staffing and efficiency changes on SLA | Target: {SLA_TARGET:.0f}%")
 
     # --- Session state setup for presets + sliders ---
     if "scenario_preset" not in st.session_state:
@@ -1200,6 +1703,91 @@ with tab_whatif:
             use_container_width=True,
         )
 
+    # --------------------------
+    # Cost Impact Calculator (NEW FEATURE)
+    # --------------------------
+    st.subheader("💰 Cost Impact Calculator")
+    
+    ops_cost_df = load_ops_cost()
+    if ops_cost_df.empty:
+        st.info("Cost data not available. Using default rates.")
+        agent_rate = 22.0
+        overtime_rate = 33.0
+    else:
+        # Get rates from first row (assuming consistent rates)
+        agent_rate = float(ops_cost_df["agent_rate"].iloc[0]) if "agent_rate" in ops_cost_df.columns else 22.0
+        overtime_rate = float(ops_cost_df["ot_rate"].iloc[0]) if "ot_rate" in ops_cost_df.columns else 33.0
+    
+    # Calculate cost impact
+    today_intervals = len(today_df)
+    hours_per_interval = 0.5  # 30-min intervals
+    
+    # Extra agent hours
+    extra_agent_hours = extra_agents * today_intervals * hours_per_interval
+    
+    # Cost at regular rate vs OT rate
+    regular_cost = extra_agent_hours * agent_rate
+    overtime_cost = extra_agent_hours * overtime_rate
+    
+    cost_col1, cost_col2, cost_col3, cost_col4 = st.columns(4)
+    
+    cost_col1.metric(
+        "Extra Agent-Hours",
+        f"{extra_agent_hours:,.1f}",
+        help=f"{extra_agents} agents × {today_intervals} intervals × 0.5 hrs"
+    )
+    
+    cost_col2.metric(
+        "Cost @ Regular Rate",
+        f"${regular_cost:,.0f}",
+        help=f"${agent_rate:.0f}/hr × {extra_agent_hours:.1f} hrs"
+    )
+    
+    cost_col3.metric(
+        "Cost @ OT Rate",
+        f"${overtime_cost:,.0f}",
+        help=f"${overtime_rate:.0f}/hr × {extra_agent_hours:.1f} hrs"
+    )
+    
+    # Cost per SLA point improvement
+    if delta_today != 0:
+        cost_per_point = regular_cost / abs(delta_today)
+        cost_col4.metric(
+            "Cost per SLA Point",
+            f"${cost_per_point:,.0f}",
+            help="Regular-rate cost divided by SLA improvement"
+        )
+    else:
+        cost_col4.metric("Cost per SLA Point", "N/A", help="No SLA change in this scenario")
+    
+    # ROI summary
+    if extra_agents != 0:
+        with st.expander("📊 Cost Analysis Details"):
+            st.markdown(f"""
+            **Scenario Summary:**
+            - **Staffing Change:** {extra_agents:+d} agents per interval
+            - **Duration:** {today_intervals} intervals ({today_intervals * 0.5:.1f} operating hours)
+            - **Total Extra Agent-Hours:** {extra_agent_hours:,.1f}
+            
+            **Cost Breakdown:**
+            | Rate Type | Hourly Rate | Total Cost |
+            |-----------|-------------|------------|
+            | Regular | ${agent_rate:.2f} | ${regular_cost:,.2f} |
+            | Overtime | ${overtime_rate:.2f} | ${overtime_cost:,.2f} |
+            
+            **SLA Impact:**
+            - Baseline SLA: {base_today:.1f}%
+            - Scenario SLA: {scenario_today:.1f}%
+            - **Net Change:** {delta_today:+.1f} percentage points
+            """)
+            
+            if delta_today > 0:
+                st.success(f"💡 This scenario improves SLA by {delta_today:.1f} pts at a cost of ${regular_cost:,.0f} (regular) or ${overtime_cost:,.0f} (OT)")
+            elif delta_today < 0:
+                st.warning(f"⚠️ This scenario reduces SLA by {abs(delta_today):.1f} pts while {'saving' if regular_cost < 0 else 'costing'} ${abs(regular_cost):,.0f}")
+    
+    st.divider()
+
     # Export Ops Brief (simple HTML -> PDF)
     if st.button("Export Ops Brief (PDF)"):
         html = f"""
@@ -1208,6 +1796,10 @@ with tab_whatif:
         <p>Baseline mean SLA (last day): {base_today:.1f}%</p>
         <p>Scenario mean SLA (last day): {scenario_today:.1f}%</p>
         <p>Delta: {delta_today:+.1f} percentage points</p>
+        <h2>Cost Impact</h2>
+        <p>Extra Agent-Hours: {extra_agent_hours:,.1f}</p>
+        <p>Cost @ Regular Rate: ${regular_cost:,.0f}</p>
+        <p>Cost @ OT Rate: ${overtime_cost:,.0f}</p>
         """
         path = export_ops_brief(html, REPORTS)
         st.success(f"Exported: {path}")

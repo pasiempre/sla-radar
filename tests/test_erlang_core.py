@@ -14,6 +14,7 @@ def _get_sla_fn():
     totally breaking the tests – just add the new name here.
     """
     candidate_names = [
+        "estimate_sla_attainment",
         "erlang_c_sla",
         "_erlang_sla",
         "service_level",

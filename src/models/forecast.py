@@ -74,8 +74,8 @@ def seasonal_mean_forecast(y: pd.Series, horizon: int) -> pd.Series:
     last = y.index.max()
     freq = pd.infer_freq(y.index)
     if freq is None:
-        # default to 30T
-        freq = "30T"
+        # default to 30min (updated from deprecated '30T')
+        freq = "30min"
     future_index = pd.date_range(last + pd.Timedelta(freq), periods=horizon, freq=freq)
 
     wk_f, slot_f = seasonal_keys(pd.Series(index=future_index, dtype=float))
